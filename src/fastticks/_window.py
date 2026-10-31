@@ -61,10 +61,12 @@ class Window:
     Window(maxtime='60s', maxlen=None, ema=None, min_count=None, warmup=None)
       maxtime : '60s' | seconds | pd.Timedelta | None   -> window (t - maxtime, t], like pandas rolling('60s')
       maxlen  : keep at most N values (both limits apply if both given)
-      ema     : '60s' or a list ['60s', '300s'] -> time-based EMAs (the value is the halflife) over ALL appended
-                ticks, == pandas ewm(halflife='60s', times=...).mean() (adjust=True; not limited to the window).
-                Default: one EMA with halflife = maxtime (none for a maxlen-only window).
-                ema() returns the first one listed; ema('300s') picks one.
+      ema     : extra EMAs, '300s' or a list ['60s', '300s'] (each value is a time halflife; numbers = seconds),
+                == pandas ewm(halflife='300s', times=...).mean() (adjust=True), over ALL appended ticks.
+                Read them with ema('300s').
+    ema() with no argument is ALWAYS the window's own EMA (never an ema= entry):
+      maxtime set -> time EMA with halflife = maxtime  == pandas ewm(halflife='60s', times=...).mean()
+      maxlen only -> tick EMA with halflife = maxlen ticks == pandas ewm(halflife=maxlen).mean() on the appended values
       min_count : ready() also needs at least this many values in the window
       warmup    : '5min' | seconds -> elapsed time (since the first tick after construction/reset) needed by
                   ready(); replaces the default of maxtime (e.g. 3-5x the ema, since an EMA needs a few halflives to settle)
@@ -72,10 +74,25 @@ class Window:
     """
 
     def __init__(self, maxtime=None, maxlen=None, ema=None, min_count=None, warmup=None):
-        if ema is None: hl = [maxtime] if maxtime is not None and _seconds(maxtime) > 0 else []
-        else: hl = list(ema) if isinstance(ema, (list, tuple)) else [ema]
-        self._hl = [_seconds(h) for h in hl]
-        self._w = _core.Window(_seconds(maxtime), int(maxlen or 0), self._hl)
+        listed = [] if ema is None else (list(ema) if isinstance(ema, (list, tuple)) else [ema])
+        mt_s = _seconds(maxtime); ml = int(maxlen or 0)
+        time_hl, tick_hl, self._listed = [], 0.0, []          # _listed: [(label, seconds, core index)] in the user's order
+        if mt_s > 0:
+            self._default = ('time', mt_s); time_hl.append(mt_s)
+        elif ml > 0:
+            self._default = ('ticks', ml); tick_hl = float(ml)
+        else:
+            self._default = None
+        base = 1 if self._default else 0
+        for e in listed:
+            h = _seconds(e)
+            if not h > 0: raise ValueError(f'ema={e!r}: halflife must be > 0')
+            if self._default and self._default[0] == 'time' and abs(h - mt_s) < 1e-12: idx = 0      # same as the default
+            elif any(abs(h - x) < 1e-12 for _, x, _ in self._listed): idx = next(i for _, x, i in self._listed if abs(h - x) < 1e-12)
+            else: idx = base + len(time_hl) - (1 if self._default and self._default[0] == 'time' else 0); time_hl.append(h)
+            self._listed.append((f'{h:g}s', h, idx))
+        self._hl = time_hl
+        self._w = _core.Window(mt_s, ml, time_hl, tick_hl)
         self.maxtime, self.maxlen = maxtime, maxlen
         self.min_count, self.warmup = min_count, warmup
         self._req_ns = int(round(_seconds(warmup) * 1e9)) if warmup is not None else self._w.maxtime_ns
@@ -126,35 +143,42 @@ class Window:
     def last(self): return self._w.last()
     def delta(self): return self._w.delta()
     def slope(self): return self._w.slope()       # OLS slope of value vs time, per second
-    def ema(self, halflife=None):
-        """EMA value. No argument: the first EMA listed (the maxtime one by default); ema('300s') picks one."""
-        return self._w.ema(self._ema_index(halflife))
+    def ema(self, sel=None):
+        """ema(): the window's own EMA (halflife = maxtime, or maxlen ticks if no maxtime). ema('300s'): one from ema=."""
+        return self._w.ema(self._ema_index(sel))
     def values(self): return self._w.values()
     def times(self): return self._w.times_ns()
     @property
     def last_time_ns(self): return self._w.last_time_ns
 
-    def _ema_index(self, halflife):
-        if not self._hl:
-            raise ValueError("this Window has no EMA (no maxtime and no ema=): create it with e.g. "
-                             "Window(maxlen=..., ema='60s') or ema=['60s', '300s']")
-        if halflife is None:
+    def _default_label(self):
+        if not self._default: return None
+        return f'{self._default[1]:g}s' if self._default[0] == 'time' else f'{self._default[1]} ticks'
+
+    def _ema_index(self, sel):
+        if sel is None:
+            if not self._default:
+                raise ValueError("ema(): this Window has no maxtime or maxlen, so it has no default EMA; "
+                                 "read a listed one with ema('60s')")
             return 0
-        h = _seconds(halflife)
-        for i, x in enumerate(self._hl):
-            if abs(x - h) < 1e-12:
-                return i
-        have = [f'{x:g}s' for x in self._hl]
-        raise ValueError(f"ema({halflife!r}) is not on this Window (it has ema={have}); add it with Window(..., ema=[...])")
+        h = _seconds(sel)
+        for _, x, i in self._listed:
+            if abs(x - h) < 1e-12: return i
+        if self._default and self._default[0] == 'time' and abs(self._default[1] - h) < 1e-12: return 0
+        have = [lab for lab, _, _ in self._listed]
+        raise ValueError(f"ema({sel!r}) is not on this Window: ema= has {have}"
+                         f" (ema() with no argument = the window's own {self._default_label() or 'none'}); "
+                         f"add it with Window(..., ema=[...])")
 
     def stats(self):
         d = dict(count=self.count(), mean=self.mean(), std=self.std(), min=self.min(), max=self.max(), range=self.range(),
                  median=self.median(), first=self.first(), last=self.last(), delta=self.delta(), slope=self.slope())
-        for h in self._hl: d[f'ema_{h:g}s'] = self._w.ema(self._hl.index(h))
+        if self._default: d['ema'] = self._w.ema(0)
+        for lab, _, i in self._listed: d[f'ema_{lab}'] = self._w.ema(i)
         return d
 
     def __repr__(self):
-        ema = [f'{h:g}s' for h in self._hl]
+        ema = [lab for lab, _, _ in self._listed]
         return (f'Window(maxtime={self.maxtime!r}, maxlen={self.maxlen!r}, ema={ema}, n={self.count()}, '
                 f'mean={self.mean():.6g}, last={self.last():.6g})')
 
@@ -222,6 +246,6 @@ class SimResult:
     def last(self): return self._out(self._r.get('last'))
     def delta(self): return self._out(self._r.get('last') - self._r.get('first'))
     def slope(self): return self._out(self._r.get('slope'))
-    def ema(self, halflife=None): return self._out(self._r.ema(self._win._ema_index(halflife)))
+    def ema(self, sel=None): return self._out(self._r.ema(self._win._ema_index(sel)))    # same rules as Window.ema
     def __len__(self): return int(np.prod(self._shape)) if self._shape else 1
     def __repr__(self): return f'SimResult(shape={self._shape}, sequential={self.sequential})'

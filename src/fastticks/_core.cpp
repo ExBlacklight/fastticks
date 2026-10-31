@@ -25,17 +25,24 @@ static i64 sec_to_ns(double s) { return (i64)std::llround(s * 1e9); }
 // Replicates pandas' cython ewm loop: com = 1, old_wt *= 0.5 ** (dt_ns / halflife_ns), done per row
 // (also across NaN rows, ignore_na=False), with the "weighted != cur" guard.
 struct EWM {
-    double hl_ns, factor = 0.5; bool adjust = true, ignore_na = false; i64 minp;
+    double hl_ns, factor = 0.5; bool adjust = true, ignore_na = false, ticks = false; i64 minp;   // ticks: halflife in rows (no times)
     bool started = false; double weighted = NaN, old_wt = 1.0, last_t = 0; i64 nobs = 0;
     EWM(double halflife_s, i64 min_periods = 0, bool adjust_ = true, bool ignore_na_ = false)
         : hl_ns((double)sec_to_ns(halflife_s)), adjust(adjust_), ignore_na(ignore_na_), minp(std::max<i64>(min_periods, 0)) {
         if (!(halflife_s > 0)) throw std::invalid_argument("halflife must be > 0");
         double alpha = 1.0 / (1.0 + 1.0); factor = 1.0 - alpha;
     }
+    // tick-count EWM == pandas x.ewm(halflife=n).mean() (adjust=True): com from pandas get_center_of_mass, delta = 1 per row
+    static EWM tick_halflife(double n, i64 min_periods = 0) {
+        if (!(n > 0)) throw std::invalid_argument("tick halflife must be > 0");
+        EWM e(1.0, min_periods); e.ticks = true; e.hl_ns = 1.0;
+        double decay = 1.0 - std::exp(std::log(0.5) / n), com = 1.0 / decay - 1.0, alpha = 1.0 / (1.0 + com);
+        e.factor = 1.0 - alpha; return e;
+    }
     double update_ns(i64 t, double cur) {
         double tf = (double)t; bool obs = cur == cur;
         if (!started) { started = true; weighted = cur; nobs = obs; old_wt = 1.0; last_t = tf; return nobs >= std::max<i64>(minp, 1) ? weighted : NaN; }
-        double delta = (tf - last_t) / hl_ns; last_t = tf; nobs += obs;
+        double delta = ticks ? 1.0 : (tf - last_t) / hl_ns; last_t = tf; nobs += obs;
         double new_wt = adjust ? 1.0 : (1.0 - factor);
         if (weighted == weighted) {
             if (obs || !ignore_na) {
@@ -234,7 +241,7 @@ PYBIND11_MODULE(_core, m) {
         .def("ema", [](const SimResult& r, size_t i) { if (i >= r.ema.size()) throw std::out_of_range("no EMA at that index"); return py::array_t<double>(r.ema[i].size(), r.ema[i].data()); })
         .def("quantile", [](const SimResult& r, double qq, i64 minp) { auto v = r.quantile(qq, minp); return py::array_t<double>(v.size(), v.data()); }, py::arg("q"), py::arg("min_periods") = 1);
     py::class_<Window>(m, "Window", "Streaming window core (times in int64 ns; use the fastticks.Window wrapper)")
-        .def(py::init<double, i64, std::vector<double>>(), py::arg("maxtime_s") = 0.0, py::arg("maxlen") = 0, py::arg("ema_halflives") = std::vector<double>{})
+        .def(py::init<double, i64, std::vector<double>, double>(), py::arg("maxtime_s") = 0.0, py::arg("maxlen") = 0, py::arg("ema_halflives") = std::vector<double>{}, py::arg("tick_halflife") = 0.0)
         .def("append_ns", &Window::append_ns, py::arg("t_ns"), py::arg("x"))
         .def("append", &Window::append, py::arg("t_s"), py::arg("x"))
         .def("extend_ns", [](Window& w, arr_ii t, arr_dd x) { if (t.size() != x.size()) throw std::invalid_argument("length mismatch");

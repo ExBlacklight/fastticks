@@ -87,6 +87,10 @@ def maxlen_checks(t_ns, x, label, rows):
     g = np.array(g); r = pd.Series(xv).rolling(50, min_periods=1)
     for j, (k, v) in enumerate((('mean', r.mean()), ('std', r.std()), ('median', r.median()), ('max', r.max()))):
         md, ok = maxdiff(g[:, j], v.values); rows.append((label, f'maxlen=50 {k} vs pandas rolling(50)', md, ok))
+    for N in (50, 500):                                   # maxlen-only default EMA = tick EMA, halflife N ticks (NaNs included)
+        w = ft.Window(maxlen=N); g = np.empty(len(x))
+        for i in range(len(x)): w.append(int(t_ns[i]), x[i]); g[i] = w.ema()
+        md, ok = maxdiff(g, pd.Series(x).ewm(halflife=N).mean().values); rows.append((label, f'maxlen={N} ema() vs pandas ewm(halflife={N})', md, ok))
     w = ft.Window(maxtime=60, maxlen=40); g = []; e = []
     idx = set(np.linspace(0, len(x) - 1, 1500).astype(int).tolist())
     for i in range(len(x)):
@@ -258,34 +262,46 @@ def test_public_api():
 
 
 def test_ema_param():
-    t_s, x = random_case(5, n=4000); t_ns = np.rint(t_s * 1e9).astype(np.int64)
+    t_s, x = random_case(5, n=4000); t_ns = np.rint(t_s * 1e9).astype(np.int64)      # includes NaNs and duplicate times
     s = pd.Series(x, index=pd.DatetimeIndex(t_ns.astype('datetime64[ns]')))
-    e60 = s.ewm(halflife='60s', times=s.index).mean().values; e300 = s.ewm(halflife='300s', times=s.index).mean().values
-    wd = ft.Window(maxtime='60s')                                  # default: one EMA, halflife = maxtime
-    wl = ft.Window(maxtime='15s', ema=['60s', '300s'])
+    ewt = lambda h: s.ewm(halflife=h, times=s.index).mean().values
+    ewn = lambda n: pd.Series(x).ewm(halflife=n).mean().values                       # tick-count EMA on the value series
+    wd = ft.Window(maxtime='60s')                                  # ema() = 60 s EMA
+    wl = ft.Window(maxtime='15s', ema=['60s', '300s'])             # ema() = 15 s EMA, NOT the first listed
     ws = ft.Window(maxtime=60, ema='300s')
-    g = np.empty((len(x), 5))
+    wn = ft.Window(maxlen=50)                                      # maxlen only -> 50-tick EMA
+    wb = ft.Window(maxtime='30s', maxlen=40, ema=['300s'])         # both -> maxtime wins
+    wnl = ft.Window(maxlen=7, ema=['60s'])
+    ws_all = (wd, wl, ws, wn, wb, wnl)
+    cols = [(lambda: wd.ema(), ewt('60s')), (lambda: wd.ema('60s'), ewt('60s')), (lambda: wd.ema(60), ewt('60s')),
+            (lambda: wl.ema(), ewt('15s')), (lambda: wl.ema('60s'), ewt('60s')), (lambda: wl.ema('300s'), ewt('300s')),
+            (lambda: ws.ema(), ewt('60s')), (lambda: ws.ema('300s'), ewt('300s')), (lambda: wn.ema(), ewn(50)),
+            (lambda: wb.ema(), ewt('30s')), (lambda: wb.ema('300s'), ewt('300s')), (lambda: wnl.ema(), ewn(7)), (lambda: wnl.ema('1min'), ewt('60s'))]
+    g = np.empty((len(x), len(cols)))
     for i in range(len(x)):
-        for w in (wd, wl, ws): w.append(int(t_ns[i]), x[i])
-        g[i] = wd.ema(), wl.ema(), wl.ema('300s'), ws.ema(), wd.ema(60)
-    for j, ref in enumerate((e60, e60, e300, e300, e60)):
+        for w in ws_all: w.append(int(t_ns[i]), x[i])
+        g[i] = [f() for f, _ in cols]
+    for j, (_, ref) in enumerate(cols):
         md, ok = maxdiff(g[:, j], ref); assert ok and md == 0.0, (j, md)
+    # simulate follows the same rules
     v = np.array([1.0, 22500.0, np.nan])
-    for w, h in ((wd, None), (wl, None), (wl, '300s')):
-        r = w.simulate(v, dt='3s').ema(h)
+    for w, h in ((wd, None), (wl, None), (wl, '300s'), (wn, None), (wnl, None), (wnl, '60s')):
+        r = w.simulate(v, dt='3s').ema(h); rs = w.simulate(v, sequential=True, dt='3s').ema(h); c2 = w.copy()
         for a in range(len(v)):
             c = w.copy(); c.append(w.last_time_ns + 3 * 10**9, v[a]); assert r[a] == c.ema(h)
-    assert 'ema_60s' in wd.stats() and {'ema_60s', 'ema_300s'} <= set(wl.stats()) and "ema=['60s', '300s']" in repr(wl)
-    wm = ft.Window(maxlen=50); wm.append(1.0, 2.0)
-    for f in (wm.ema, lambda: wm.simulate(3.0).ema()):
-        try: f(); raise AssertionError('maxlen-only ema() must raise')
-        except ValueError as e: assert 'ema=' in str(e)
-    w5 = ft.Window(maxlen=50, ema='60s'); w5.append(0.0, 7.0); assert w5.ema() == 7.0
-    try: wl.ema('120s'); raise AssertionError
-    except ValueError as e: assert '120' in str(e) and 'ema=' in str(e)
+            c2.append(w.last_time_ns + (a + 1) * 3 * 10**9, v[a]); assert rs[a] == c2.ema(h) or (np.isnan(rs[a]) and np.isnan(c2.ema(h)))
+    # stats keys / repr
+    assert wl.stats()['ema'] == wl.ema() and wl.stats()['ema_60s'] == wl.ema('60s') and wl.stats()['ema_300s'] == wl.ema('300s')
+    assert set(k for k in wn.stats() if k.startswith('ema')) == {'ema'} and "ema=['60s', '300s']" in repr(wl)
+    # errors
+    for f in (lambda: wl.ema('120s'), lambda: wn.ema('60s'), lambda: wl.simulate(1.0).ema('120s')):
+        try: f(); raise AssertionError('unlisted ema(sel) must raise')
+        except ValueError as e: assert 'not on this Window' in str(e) and "Window(..., ema=" in str(e), str(e)
+    try: ft.Window(warmup=10).ema(); raise AssertionError
+    except ValueError: pass
     try: ft.Window(maxtime='60s', ema_halflife='60s'); raise AssertionError('old name must be gone')
     except TypeError: pass
-
+    w = ft.Window(maxlen=3); w.append(0.0, 1.0); w.append(1.0, 2.0); w.reset(); w.append(5.0, 9.0); assert w.ema() == 9.0   # reset clears it
 
 if __name__ == '__main__':
     rows = _rows_random(0)

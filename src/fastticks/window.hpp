@@ -36,9 +36,11 @@ struct Window {
     i64 last_t = 0, first_t = 0; bool has_t = false; i64 n_appends = 0;   // first_t: first append since construction/reset (warm-up)
     double run_v = NaN; i64 run = 0;           // trailing run of equal values -> exact 0 variance (as pandas)
 
-    Window(double maxtime_s, i64 maxlen_, std::vector<double> ema_halflives) : maxlen(maxlen_) {
+    // tick_halflife > 0: EMA #0 is a tick-count EMA (pandas ewm(halflife=n) on the appended values), then the time EMAs
+    Window(double maxtime_s, i64 maxlen_, std::vector<double> ema_halflives, double tick_halflife = 0.0) : maxlen(maxlen_) {
         if (maxtime_s > 0) maxtime = sec_to_ns(maxtime_s);
         if (maxtime_s < 0 || maxlen_ < 0) throw std::invalid_argument("maxtime / maxlen must be >= 0");
+        if (tick_halflife > 0) { emas.push_back(EWM::tick_halflife(tick_halflife, 0)); hls.push_back(NaN); }
         for (double h : ema_halflives) { emas.emplace_back(h, 0); hls.push_back(h); }
     }
 

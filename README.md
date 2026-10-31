@@ -94,7 +94,8 @@ def on_tick(t_sec, ltp, dabs, is_up_event):
 import numpy as np
 from fastticks import Window
 
-window = Window(maxtime='60s', ema_halflife=['60s', '300s'])   # maxtime: '60s' | 60 | pd.Timedelta; maxlen=N optional
+window = Window(maxtime='60s', ema=['60s', '300s'])   # maxtime: '60s' | 60 | pd.Timedelta; maxlen=N optional
+# Window(maxtime='60s') alone already has one EMA (halflife 60s): window.ema()
 
 def on_tick(time, ltp):            # time: datetime / pd.Timestamp / np.datetime64 / float seconds / int ns
     window.append(time, ltp)
@@ -117,7 +118,7 @@ seq.quantile(0.9)                        # sequential mode: median() always, oth
 ### Warm-up: `ready()`
 
 ```python
-window = Window(maxtime='60s', ema_halflife='60s', warmup='5min', min_count=50)
+window = Window(maxtime='60s', warmup='5min', min_count=50)   # default ema = 60s; warm up 5x that
 
 def on_tick(time, ltp):
     window.append(time, ltp)
@@ -131,7 +132,7 @@ sim.ready()                              # bool array, same shape as one_list (s
 ```
 
 `ready()` becomes True once **all** of these hold:
-- **Elapsed time:** the time since the **first tick appended after construction or `reset()`** is ≥ `warmup` if you gave it, otherwise ≥ `maxtime`, so the window has seen one full span. Use `warmup` to wait longer, for example 3–5× the EMA halflife.
+- **Elapsed time:** the time since the **first tick appended after construction or `reset()`** is ≥ `warmup` if you gave it, otherwise ≥ `maxtime`, so the window has seen one full span. Use `warmup` to wait longer, for example 3–5× the `ema` value, because an EMA needs a few halflives to settle.
 - **maxlen:** if `maxlen` is set, count ≥ `maxlen`. With maxlen only and no maxtime, this is the only rule.
 - **min_count:** if `min_count` is set, the current count must also be ≥ `min_count`.
 
@@ -144,11 +145,14 @@ Notes:
 
 `append`, `extend` and `reset` return `None`, so nothing gets echoed in the REPL. Import with `from fastticks import Window`; the internal modules are private.
 
-Stats (on `Window` and on a `simulate` result, same names): `ready count sum mean sma var std median quantile(q) max min range first last delta slope ema(halflife)`; `window.stats()` gives a dict of all of them, and `values()` / `times()` return the window contents.
+Stats (on `Window` and on a `simulate` result, same names): `ready count sum mean sma var std median quantile(q) max min range first last delta slope ema()` / `ema('300s')`; `window.stats()` gives a dict of all of them, and `values()` / `times()` return the window contents.
 
 - **Window rule:** like pandas `rolling('60s')`, the window is (t − maxtime, t], measured from the latest tick's time. With `maxlen`, at most N values are kept; if you give both, both limits apply.
 - **`sma` is the same as `mean`.** `var`/`std` use ddof=1 by default, like pandas. `delta` = last − first. `slope` is the least-squares slope of the price against time in seconds (NaN when fewer than 2 distinct times).
-- **EMA** is pandas `ewm(halflife=..., times=...).mean()` (adjust=True) over **all** appended ticks, not just the window. `ema()` with no argument gives the first halflife.
+- **EMA:** `ema='60s'` or `ema=['60s', '300s']`. The value is the EMA's halflife, and the result equals pandas `ewm(halflife='60s', times=...).mean()` (adjust=True). It runs over **all** appended ticks, not just the window.
+  - If you don't pass `ema`, a window with `maxtime` gets one EMA whose halflife equals `maxtime`, so `Window(maxtime='60s').ema()` is the 60 s EMA.
+  - `ema()` with no argument returns the first one listed; `ema('300s')` picks one.
+  - A maxlen-only window has no EMA unless you pass `ema=`. Calling `ema()` on it raises an error that tells you to pass `ema=`.
 - **NaN prices** are skipped like pandas does: the time still advances (old ticks expire) but nothing is added, and `maxlen` counts only real values.
 - **`simulate` timing:** the default `t` is the last appended time, so nothing extra expires. `t` must not be earlier than the last appended time.
 - **Independent mode (default):** each value is its own "what if this is the next tick". It is vectorized in C++, with no copy of the window.

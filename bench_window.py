@@ -18,7 +18,7 @@ def per(f, n, rep=3):
 def main(path):
     t_ns, x = load_spot(path); n = len(x); tl = t_ns.tolist(); ts = (t_ns / 1e9).tolist(); xl = x.tolist()
     pts = [pd.Timestamp(v) for v in t_ns[:20000]]
-    mk = lambda: ft.Window(maxtime='60s', ema_halflife=['60s', '300s'])
+    mk = lambda: ft.Window(maxtime='60s', ema=['60s', '300s'])
     print(f'{os.path.basename(path)}: {n:,} spot ticks, Window(maxtime=60s, 2 EMAs)\n\nper-append cost from Python (us/tick):')
     def a_ns():
         w = mk()

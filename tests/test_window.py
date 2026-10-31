@@ -43,7 +43,7 @@ def exact_stats(tt, vv):
 
 
 def append_vs_pandas(t_ns, x, label, rows, W=60):
-    w = ft.Window(maxtime=f'{W}s', ema_halflife=['60s', '300s'])
+    w = ft.Window(maxtime=f'{W}s', ema=['60s', '300s'])
     got = np.empty((len(x), len(STATS)))
     for i in range(len(x)):
         w.append(int(t_ns[i]), x[i]); got[i] = stats_of(w)
@@ -101,7 +101,7 @@ def maxlen_checks(t_ns, x, label, rows):
 
 def simulate_checks(t_ns, x, label, rows, seed=0, maxlen=None):
     rng = np.random.default_rng(seed); n = len(x)
-    w = ft.Window(maxtime='60s', maxlen=maxlen, ema_halflife=['60s', '300s'])
+    w = ft.Window(maxtime='60s', maxlen=maxlen, ema=['60s', '300s'])
     stops = sorted(rng.choice(np.arange(50, n - 1), 12, replace=False)); worst_i = np.zeros(len(STATS)); worst_s = np.zeros(len(STATS)); okall = True
     i = 0
     for stop in stops:
@@ -173,7 +173,7 @@ def ready_checks(t_ns, x, seed=0):
     """Window.ready() / warmup_left() and SimResult.ready() vs the definition and vs copy+append. Returns #checks."""
     rng = np.random.default_rng(seed); n_checks = 0
     configs = [dict(maxtime='60s'), dict(maxlen=50), dict(maxtime='60s', maxlen=40), dict(maxtime='60s', min_count=100),
-               dict(maxtime='60s', warmup='5min', ema_halflife='60s'), dict(warmup=30), dict()]
+               dict(maxtime='60s', warmup='5min', ema='60s'), dict(warmup=30), dict()]
     for cfg in configs:
         w = ft.Window(**cfg)
         req_ns = int(round(ft._window._seconds(cfg['warmup']) * 1e9)) if 'warmup' in cfg else int(round(ft._window._seconds(cfg.get('maxtime')) * 1e9))
@@ -236,7 +236,7 @@ def test_window_random():
 
 def test_time_inputs():
     import datetime as dt
-    w = ft.Window(maxtime=pd.Timedelta('60s'), ema_halflife='60s'); t0 = pd.Timestamp('2026-10-01 09:15:00')
+    w = ft.Window(maxtime=pd.Timedelta('60s'), ema='60s'); t0 = pd.Timestamp('2026-10-01 09:15:00')
     w.append(t0, 1.0); w.append(t0.to_pydatetime() + dt.timedelta(seconds=30), 2.0); w.append(np.datetime64(t0 + pd.Timedelta('70s')), 3.0)
     w.append(int((t0 + pd.Timedelta('80s')).value), 4.0); w.append((t0 + pd.Timedelta('85s')).value / 1e9, 5.0)
     assert w.count() == 4 and w.first() == 2.0 and w.last() == 5.0, (w.count(), w.first())
@@ -257,12 +257,42 @@ def test_public_api():
     assert set(ft.__all__) <= set(dir(ft))
 
 
+def test_ema_param():
+    t_s, x = random_case(5, n=4000); t_ns = np.rint(t_s * 1e9).astype(np.int64)
+    s = pd.Series(x, index=pd.DatetimeIndex(t_ns.astype('datetime64[ns]')))
+    e60 = s.ewm(halflife='60s', times=s.index).mean().values; e300 = s.ewm(halflife='300s', times=s.index).mean().values
+    wd = ft.Window(maxtime='60s')                                  # default: one EMA, halflife = maxtime
+    wl = ft.Window(maxtime='15s', ema=['60s', '300s'])
+    ws = ft.Window(maxtime=60, ema='300s')
+    g = np.empty((len(x), 5))
+    for i in range(len(x)):
+        for w in (wd, wl, ws): w.append(int(t_ns[i]), x[i])
+        g[i] = wd.ema(), wl.ema(), wl.ema('300s'), ws.ema(), wd.ema(60)
+    for j, ref in enumerate((e60, e60, e300, e300, e60)):
+        md, ok = maxdiff(g[:, j], ref); assert ok and md == 0.0, (j, md)
+    v = np.array([1.0, 22500.0, np.nan])
+    for w, h in ((wd, None), (wl, None), (wl, '300s')):
+        r = w.simulate(v, dt='3s').ema(h)
+        for a in range(len(v)):
+            c = w.copy(); c.append(w.last_time_ns + 3 * 10**9, v[a]); assert r[a] == c.ema(h)
+    assert 'ema_60s' in wd.stats() and {'ema_60s', 'ema_300s'} <= set(wl.stats()) and "ema=['60s', '300s']" in repr(wl)
+    wm = ft.Window(maxlen=50); wm.append(1.0, 2.0)
+    for f in (wm.ema, lambda: wm.simulate(3.0).ema()):
+        try: f(); raise AssertionError('maxlen-only ema() must raise')
+        except ValueError as e: assert 'ema=' in str(e)
+    w5 = ft.Window(maxlen=50, ema='60s'); w5.append(0.0, 7.0); assert w5.ema() == 7.0
+    try: wl.ema('120s'); raise AssertionError
+    except ValueError as e: assert '120' in str(e) and 'ema=' in str(e)
+    try: ft.Window(maxtime='60s', ema_halflife='60s'); raise AssertionError('old name must be gone')
+    except TypeError: pass
+
+
 if __name__ == '__main__':
     rows = _rows_random(0)
     if len(sys.argv) > 1:
         t_ns, ltp = load_spot(sys.argv[1]); lab = 'real ' + os.path.basename(sys.argv[1])[6:16]
         append_vs_pandas(t_ns, ltp, lab, rows); maxlen_checks(t_ns, ltp, lab, rows)
         simulate_checks(t_ns, ltp, lab, rows, 1); simulate_checks(t_ns, ltp, lab, rows, 2, maxlen=200)
-    test_time_inputs(); test_ready(); test_public_api()
+    test_time_inputs(); test_ready(); test_public_api(); test_ema_param()
     if len(sys.argv) > 1: print(f'ready(): {ready_checks(t_ns, ltp, 1):,} checks on the real day vs definition / copy+append: OK')
     sys.exit(0 if report(rows) else 1)
